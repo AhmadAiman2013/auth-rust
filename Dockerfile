@@ -23,8 +23,6 @@ COPY . .
 # for explicit clarity and safety.
 RUN cargo build --release --target aarch64-unknown-linux-musl
 
----
-
 ## 🚀 Runtime stage (minimal)
 FROM scratch
 WORKDIR /app
