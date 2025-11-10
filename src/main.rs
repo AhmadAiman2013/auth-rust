@@ -10,7 +10,7 @@ use openidconnect::{
 use redis::Client;
 use std::{sync::Arc, vec};
 
-use crate::auth_oidc::{callback, csrf, login, logout, verify, AppState, HTTP_CLIENT};
+use crate::auth_oidc::{callback, csrf, get_http_client, login, logout, verify, AppState};
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -39,7 +39,7 @@ async fn main() -> std::io::Result<()> {
     log::info!("Discovering OIDC provider metadata...");
     let provider_metadata = CoreProviderMetadata::discover_async(
         IssuerUrl::new(issuer_url).expect("Invalid issuer URL"),
-        &*HTTP_CLIENT,
+        &*get_http_client(),
     )
     .await
     .expect("Failed to discover provider metadata");
@@ -66,9 +66,11 @@ async fn main() -> std::io::Result<()> {
         .await
         .expect("Failed to connect to Redis");
     
-    let app_state = AppState {
-        oidc_client: Arc::new(oidc_client),
-    };
+    
+    let oidc_client = Arc::new(oidc_client);
+    
+    let state = AppState::new(oidc_client);
+    
     
     log::info!("Starting auth service at http://localhost:8080");
 
@@ -85,7 +87,7 @@ async fn main() -> std::io::Result<()> {
             .max_age(3600);
         
         App::new()
-            .app_data(web::Data::new(app_state.clone()))
+            .app_data(web::Data::new(state.clone()))
             .wrap(Logger::default())
             .wrap(
                 SessionMiddleware::builder(

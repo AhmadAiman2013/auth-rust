@@ -1,14 +1,15 @@
 use std::{sync::Arc};
+use std::sync::OnceLock;
+use anyhow::{Context, Result};
 use actix_session::Session;
 use actix_web::{cookie::{Cookie}, get, post, web, Error, HttpRequest, HttpResponse};
 use actix_web::cookie::time::Duration;
-use once_cell::sync::Lazy;
-use openidconnect::{
-    AccessTokenHash, AuthenticationFlow, AuthorizationCode, CsrfToken, Nonce, OAuth2TokenResponse,
-    PkceCodeChallenge, Scope, TokenResponse, core::CoreResponseType,
-};
+use chrono::{DateTime, Utc};
+use dashmap::DashMap;
+use openidconnect::{AccessTokenHash, AuthenticationFlow, AuthorizationCode, CsrfToken, Nonce, OAuth2TokenResponse, PkceCodeChallenge, Scope, TokenResponse, core::CoreResponseType, RefreshToken};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 type OidcClient = openidconnect::Client<
     openidconnect::EmptyAdditionalClaims,
@@ -45,6 +46,16 @@ type OidcClient = openidconnect::Client<
 #[derive(Clone)]
 pub struct AppState {
     pub oidc_client: Arc<OidcClient>,
+    pub refresh_locks: Arc<DashMap<String, Arc<Mutex<()>>>>
+}
+
+impl AppState {
+    pub fn new(oidc_client: Arc<OidcClient>) -> Self {
+        AppState {
+            oidc_client,
+            refresh_locks: Arc::new(DashMap::new()),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -55,7 +66,10 @@ struct UserInfo {
 }
 
 #[get("/auth/verify")]
-pub async fn verify(session: Session, req: HttpRequest) -> Result<HttpResponse, Error> {
+pub async fn verify(
+    data: web::Data<AppState>,
+    session: Session,
+    req: HttpRequest) -> Result<HttpResponse, Error> {
     let stored_csrf: Option<String> = session.get("web_csrf")?;
 
     // Compare CSRF token from "x-csrf" header to the stored one
@@ -76,23 +90,131 @@ pub async fn verify(session: Session, req: HttpRequest) -> Result<HttpResponse, 
 
     let user_info: Option<UserInfo> = session.get("user_info")?;
 
-    match user_info {
-        Some(user) => {
-            log::info!("Authentication successful for user: {}", user.sub);
-            Ok(HttpResponse::Ok()
-                .insert_header(("x-user-id", user.sub.clone()))
-                .insert_header(("x-user-email", user.email.clone().unwrap_or_default()))
-                .insert_header(("x-user-name", user.name.clone().unwrap_or_default()))
-                .finish())
-        },
-        None => {
-            log::warn!("Authentication failed for path: {}", req.path());
-            Ok(HttpResponse::Unauthorized()
-                .insert_header(("WWW-Authenticate", "Bearer"))
-                .finish())
+    if let Some(user) = &user_info {
+        // only expired users need to acquire the lock
+        let user_id = user.sub.clone();
+        let lock = data
+            .refresh_locks
+            .entry(user_id.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+
+        let _guard = lock.lock().await; // Acquire the lock for this user
+
+        if let Err(e) = refresh_token(&session, &data.oidc_client).await {
+            let expiry_str: Option<String> = session.get("expiry_id_token")?;
+            let token_is_valid = expiry_str
+                .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+                .map_or(false, |expiry| {
+                    Utc::now() + chrono::Duration::minutes(5) < expiry
+                });
+
+            if !token_is_valid {
+                log::error!("Token refresh failed and token is invalid/expired: {}", e);
+                session.purge();
+                return Ok(HttpResponse::Unauthorized()
+                    .insert_header(("WWW-Authenticate", "Bearer"))
+                    .finish());
+            }
+        } else {
+            log::info!("Token refresh failed but token is valid (concurrent request)");
         }
+    } else {
+        log::warn!("No user_info found in session for path: {}", req.path());
+        return Ok(HttpResponse::Unauthorized()
+            .insert_header(("WWW-Authenticate", "Bearer"))
+            .finish());
     }
+
+
+    let user = user_info.unwrap();
+    log::info!("Authentication successful for user: {}", user.sub);
+    Ok(HttpResponse::Ok()
+        .insert_header(("x-user-id", user.sub.clone()))
+        .insert_header(("x-user-email", user.email.clone().unwrap_or_default()))
+        .insert_header(("x-user-name", user.name.clone().unwrap_or_default()))
+        .finish())
+
 }
+
+pub async fn refresh_token(
+    session: &Session,
+    client: &OidcClient
+) -> Result<()> {
+    // step 1: check if expiry_id_token is present
+    let expiry_id_token: Option<String> = session.get("expiry_id_token")
+        .context("Failed to read expiry_id_token from session")?;
+
+    let expiry_id_token = expiry_id_token
+        .ok_or_else(|| anyhow::anyhow!("No expiry_id_token found in session"))?;
+
+    log::info!("Found expiry_id_token in session: {}", expiry_id_token);
+
+    // step 2: parse expiry time
+    let expiry_time: DateTime<Utc> = expiry_id_token
+        .parse::<DateTime<Utc>>()
+        .context("Failed to parse expiry_id_token as DateTime<Utc>")?;
+
+    log::info!("Id token expiry time: {}", expiry_time);
+
+    let now  = Utc::now();
+    let buffer = chrono::Duration::minutes(5);
+
+    if now + buffer < expiry_time {
+        log::info!("Id token is still valid, no refresh needed");
+        return Ok(());
+    }
+
+    log::info!("token is expired or about to expire, attempting refresh");
+
+    // Step 3: get refresh token
+    let refresh_token: Option<String> = session.get("refresh_token")
+        .context("Failed to read refresh_token from session")?;
+
+    let refresh_token = refresh_token
+        .ok_or_else(|| anyhow::anyhow!("No refresh_token found in session"))?;
+
+    log::info!("Found refresh_token in session");
+
+    // Step 4 : perform token refresh
+    let refresh_token = RefreshToken::new(refresh_token);
+
+    let http_client = get_http_client();
+
+    let token_response = client
+        .exchange_refresh_token(&refresh_token)
+        .context("Failed to create refresh token")?
+        .request_async(&*http_client)
+        .await
+        .context("Failed to request new tokens using refresh token")?;
+
+    log::info!("Token refresh successful");
+
+    // Step 5: update session with new tokens and expiry
+    let new_access_token = token_response.access_token().secret().to_string();
+    session.insert("access_token", new_access_token)
+        .context("Failed to store new access_token in session")?;
+
+    log::info!("Stored new access_token in session");
+
+    if let Some(new_refresh_token) = token_response.refresh_token() {
+        session.insert("refresh_token", new_refresh_token.secret())
+            .context("Failed to store new refresh_token in session")?;
+        log::info!("Stored new refresh_token in session");
+    }
+
+    if let Some(expiry_id_token) = token_response.expires_in() {
+        let expiry_time = Utc::now() + chrono::Duration::from_std(expiry_id_token)
+            .unwrap_or(chrono::Duration::seconds(3600)); // default to 1 hour if conversion fails
+        session.insert("expiry_id_token", expiry_time.to_string())
+            .context("Failed to store new expiry_id_token in session")?;
+        log::info!("Stored new expiry_id_token in session: {}", expiry_time);
+    }
+
+    log::info!("Token refresh process completed successfully");
+    Ok(())
+}
+
 
 #[get("/auth/csrf")]
 pub async fn csrf(session: Session) -> Result<HttpResponse, Error> {
@@ -235,7 +357,7 @@ pub async fn callback(
             actix_web::error::ErrorInternalServerError("OIDC configuration error")
         })?
         .set_pkce_verifier(pkce_verifier)
-        .request_async(&*HTTP_CLIENT)
+        .request_async(&*get_http_client())
         .await
         .map_err(|e| {
             log::error!("Token exchange failed: {:?}", e);
@@ -300,12 +422,17 @@ pub async fn callback(
     log::info!("User authenticated: {}", user_info.sub);
 
     let token_expiry = claims.expiration();
+
+    // TESTING override expiry to 1 minute from now
+    // let test_expiry = Utc::now() + chrono::Duration::minutes(7);
+    // log::warn!("Overriding token expiry for testing purposes: {}", test_expiry);
+
+
     // Store user info and tokens in session
     session.insert("user_info", &user_info)?;
     session.insert("access_token", token_response.access_token().secret())?;
     session.insert("expiry_id_token", token_expiry)?;
     session.insert("refresh_token", token_response.refresh_token().map(|t| t.secret()))?;
-    session.insert("expiry_refresh_token", 86400)?; // 
 
 
     // Get post-login redirect URL
@@ -333,12 +460,23 @@ async fn logout(session: Session) -> Result<HttpResponse, Error> {
     })))
 }
 
-pub static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
-    reqwest::ClientBuilder::new()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("Failed to build HTTP client")
-});
+// pub static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
+//     reqwest::ClientBuilder::new()
+//         .redirect(reqwest::redirect::Policy::none())
+//         .build()
+//         .expect("Failed to build HTTP client")
+// });
+
+pub static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+
+pub fn get_http_client() -> &'static Client {
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::ClientBuilder::new()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("Failed to build HTTP client")
+    })
+}
 
 fn get_redirect_url(req: &HttpRequest) -> Option<String> {
     // Production (behind traefik): Reconstruct from forwarded headers
