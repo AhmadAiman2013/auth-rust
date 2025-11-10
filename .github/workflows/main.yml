@@ -2,7 +2,8 @@ name: Build and Push ARM64 Docker
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - master
   pull_request:
 
 jobs:
