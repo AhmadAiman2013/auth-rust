@@ -13,8 +13,6 @@ COPY . .
 # This command should now succeed as the linker dependencies are available.
 RUN cargo build --release --target aarch64-unknown-linux-musl
 
----
-
 ## 🚀 Runtime stage (minimal)
 FROM scratch
 WORKDIR /app
