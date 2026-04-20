@@ -1,14 +1,12 @@
-## 🏗️ Builder stage
-FROM rust:1.90-alpine AS builder
+## Builder stage
+FROM rust:1.95-alpine AS builder
 
 WORKDIR /app
 
-# --- 🎯 FIX: Install build-base for the linker files (crti.o) ---
 # 'build-base' provides gcc, make, musl-dev, and linker objects.
 # 'openssl-dev' should contain the static libs on musl.
 RUN apk update && apk add --no-cache build-base openssl-dev pkgconf
 
-# --- ⚙️ Configure Cargo to find OpenSSL Headers and Static Libs ---
 # Alpine installs OpenSSL headers under /usr/include/openssl
 # and the libraries under /usr/lib
 ENV OPENSSL_INCLUDE_DIR=/usr/include/
@@ -24,7 +22,7 @@ COPY . .
 # This command remains clean, relying on the environment variables above.
 RUN cargo build --release --target aarch64-unknown-linux-musl
 
-## 🚀 Runtime stage (minimal)
+## Runtime stage
 FROM scratch
 WORKDIR /app
 

@@ -7,7 +7,7 @@ use actix_web::cookie::time::Duration;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use openidconnect::{AccessTokenHash, AuthenticationFlow, AuthorizationCode, CsrfToken, Nonce, OAuth2TokenResponse, PkceCodeChallenge, Scope, TokenResponse, core::CoreResponseType, RefreshToken};
-use reqwest::Client;
+use openidconnect::reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -471,8 +471,8 @@ pub static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 
 pub fn get_http_client() -> &'static Client {
     HTTP_CLIENT.get_or_init(|| {
-        reqwest::ClientBuilder::new()
-            .redirect(reqwest::redirect::Policy::none())
+       openidconnect::reqwest::ClientBuilder::new()
+            .redirect(openidconnect::reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to build HTTP client")
     })

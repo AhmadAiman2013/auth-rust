@@ -34,11 +34,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image (ARM64 only)
-        uses: docker/build-push-action@v6
+      - name: Read version
+        id: version
+        run: echo "value=$(jq -r .version version.json)" >> $GITHUB_OUTPUT
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
         with:
-          push: true
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            ghcr.io/ahmadaiman2013/auth-rust:latest
-            ghcr.io/ahmadaiman2013/auth-rust:${{ github.sha }}
+            type=raw,value=${{ steps.version.outputs.value }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push Docker image (ARM64 only)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
           platforms: linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
