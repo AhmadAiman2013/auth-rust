@@ -460,13 +460,6 @@ async fn logout(session: Session) -> Result<HttpResponse, Error> {
     })))
 }
 
-// pub static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
-//     reqwest::ClientBuilder::new()
-//         .redirect(reqwest::redirect::Policy::none())
-//         .build()
-//         .expect("Failed to build HTTP client")
-// });
-
 pub static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 
 pub fn get_http_client() -> &'static Client {
